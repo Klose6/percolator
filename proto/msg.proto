@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+message TimestampRequest {}
+message TimestampResponse {
+  uint64 timestamp = 1;
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+}
+
+message PrewriteRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 start_ts = 3;
+}
+
+message PrewriteResponse {}
+
+message CommitRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 commit_ts = 3;
+}
+
+message CommitResponse {
+  bool ok = 1;
+}

@@ -2,23 +2,22 @@
 name = "percolator"
 version = "0.1.0"
 authors = ["Klose6"]
-edition = "2026"
+edition = "2024"
 build = "build.rs"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-futures = "0.3"
-futures-timer = "3.0"
-log = "0.4"
-prost = "0.6"
-prost-derive = "0.6"
+async-trait = "0.1.89"
+futures = "0.3.32"
+futures-timer = "3.0.4"
+log = "0.4.33"
+prost = "0.14.4"
+prost-derive = "0.14.4"
 
-labrpc = { path = "../labrpc" }
-labcodec = { path = "../labcodec" }
+labrpc = "0.2.3"
 
 [build-dependencies]
-prost-build = "0.6"
+prost-build = "0.14.4"
 
 [dev-dependencies]
-env_logger = "0.7"
+env_logger = "0.11.11"

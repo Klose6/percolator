@@ -1,7 +1,3 @@
-use crate::msg::{
-    CommitRequest, CommitResponse, GetRequest, GetResponse, PrewriteRequest, PrewriteResponse,
-    TimestampRequest, TimestampResponse,
-};
 
 labrpc::service! {
     service timestamp {
@@ -9,7 +5,7 @@ labrpc::service! {
     }
 }
 
-pub use timestamp::{add_service as add_tso_service, Client as TSOClient, Service};
+pub use timestamp::Client as TSOClient;
 
 labrpc::service! {
     service transaction {
@@ -19,4 +15,4 @@ labrpc::service! {
     }
 }
 
-pub use transaction::{add_service as add_transaction_service, Client as TransactionClient};
+pub use transaction::Client as TransactionClient;
