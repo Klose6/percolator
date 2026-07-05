@@ -13,18 +13,30 @@ const TTL: u64 = Duration::from_millis(100).as_nanos() as u64;
 
 #[derive(Clone, Default)]
 pub struct TimestampOracle {
-    // You definitions here if needed.
-    
+    last_ts: Arc<Mutex<u64>>,
+}
+
+impl TimestampOracle {
+    pub fn new() -> Self {
+        Self {
+            last_ts: Arc::new(Mutex::new(0)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl timestamp::Service for TimestampOracle {
     // example get_timestamp RPC handler.
     async fn get_timestamp(&self, _: TimestampRequest) -> labrpc::Result<TimestampResponse> {
-        let timestamp = SystemTime::now()
+        let mut last_ts = self.last_ts.lock().unwrap();
+
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_nanos() as u64;
+
+        let timestamp = if now > *last_ts { now } else { *last_ts + 1 };
+        *last_ts = timestamp;
 
         Ok(TimestampResponse { timestamp })
     }
