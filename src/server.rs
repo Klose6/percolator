@@ -79,8 +79,23 @@ impl KvTable {
         ts_start_inclusive: Option<u64>,
         ts_end_inclusive: Option<u64>,
     ) -> Option<(&Key, &Value)> {
-        // Your code here.
-        unimplemented!()
+         // Select the appropriate column
+        let map = match column {
+            Column::Write => &self.write,
+            Column::Data => &self.data,
+            Column::Lock => &self.lock,
+        };
+
+        // Define the timestamp range
+        let ts_start = ts_start_inclusive.unwrap_or(0);
+        let ts_end = ts_end_inclusive.unwrap_or(u64::MAX);
+
+        // Find the latest entry within the timestamp range
+        // We iterate in reverse to find the most recent timestamp first
+        map.range((key.clone(), ts_start)..=(key.clone(), ts_end))
+            .rev()
+            .find(|((k, _), _)| k == &key)
+            .map(|(k, v)| (k, v))
     }
 
     // Writes a record to a specified column in MemoryStorage.
