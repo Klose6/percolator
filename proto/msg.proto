@@ -24,7 +24,8 @@ message PrewriteResponse {}
 message CommitRequest {
   bytes key = 1;
   bytes value = 2;
-  uint64 commit_ts = 3;
+  uint64 start_ts = 3;
+  uint64 commit_ts = 4;
 }
 
 message CommitResponse {
