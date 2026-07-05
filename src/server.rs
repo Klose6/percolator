@@ -101,15 +101,23 @@ impl KvTable {
     // Writes a record to a specified column in MemoryStorage.
     #[inline]
     fn write(&mut self, key: Vec<u8>, column: Column, ts: u64, value: Value) {
-        // Your code here.
-        unimplemented!()
+        let map = match column {
+            Column::Write => &mut self.write,
+            Column::Data => &mut self.data,
+            Column::Lock => &mut self.lock,
+        };
+        map.insert((key, ts), value);
     }
 
     #[inline]
     // Erases a record from a specified column in MemoryStorage.
     fn erase(&mut self, key: Vec<u8>, column: Column, commit_ts: u64) {
-        // Your code here.
-        unimplemented!()
+       let map = match column {
+            Column::Write => &mut self.write,
+            Column::Data => &mut self.data,
+            Column::Lock => &mut self.lock,
+        };
+        map.remove(&(key, commit_ts));
     }
 }
 
@@ -137,8 +145,33 @@ impl transaction::Service for MemoryStorage {
 
     // example prewrite RPC handler.
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
-        // Your code here.
-        unimplemented!()
+         let mut table = self.data.lock().unwrap();
+    
+        // Check for lock conflict - if any lock exists on this key, abort
+        if table.read(req.key.clone(), Column::Lock, None, None).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "lock conflict",
+            ));
+        }
+        
+        // Check for write conflict - if there's a write at timestamp > start_ts, abort
+        if let Some(((_, write_ts), _)) = table.read(req.key.clone(), Column::Write, Some(req.start_ts + 1), None) {
+            if *write_ts > req.start_ts {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "write conflict",
+                ));
+            }
+        }
+        
+        // No conflicts, write lock at start_ts
+        table.write(req.key.clone(), Column::Lock, req.start_ts, Value::Timestamp(req.start_ts));
+        
+        // Write data at start_ts
+        table.write(req.key, Column::Data, req.start_ts, Value::Vector(req.value));
+        
+        Ok(PrewriteResponse {})
     }
 
     // example commit RPC handler.
