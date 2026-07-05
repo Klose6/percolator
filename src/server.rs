@@ -26,7 +26,6 @@ impl TimestampOracle {
 
 #[async_trait::async_trait]
 impl timestamp::Service for TimestampOracle {
-    // example get_timestamp RPC handler.
     async fn get_timestamp(&self, _: TimestampRequest) -> labrpc::Result<TimestampResponse> {
         let mut last_ts = self.last_ts.lock().unwrap();
 
@@ -34,7 +33,7 @@ impl timestamp::Service for TimestampOracle {
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_nanos() as u64;
-
+        // Ensure that the returned timestamp is always greater than the last one.
         let timestamp = if now > *last_ts { now } else { *last_ts + 1 };
         *last_ts = timestamp;
 
@@ -110,8 +109,15 @@ pub struct MemoryStorage {
 impl transaction::Service for MemoryStorage {
     // example get RPC handler.
     async fn get(&self, req: GetRequest) -> labrpc::Result<GetResponse> {
-        // Your code here.
-        unimplemented!()
+        let table = self.data.lock().unwrap();
+        let value = table.read(req.key, Column::Data, None, Some(u64::MAX));
+    
+        let response = match value {
+            Some((_, Value::Vector(v))) => GetResponse { value: v.clone() },
+            _ => GetResponse { value: vec![] },
+        };
+        
+        Ok(response)
     }
 
     // example prewrite RPC handler.
