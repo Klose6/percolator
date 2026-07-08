@@ -145,14 +145,24 @@ impl transaction::Service for MemoryStorage {
 
     // example prewrite RPC handler.
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
-         let mut table = self.data.lock().unwrap();
-    
+        let mut table = self.data.lock().unwrap();
+   
         // Check for lock conflict - if any lock exists on this key, abort
-        if table.read(req.key.clone(), Column::Lock, None, None).is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "lock conflict",
-            ));
+        if let Some(((_, lock_ts), _)) = table.read(req.key.clone(), Column::Lock, None, None) {
+            let lock_ts_copy = *lock_ts; // Copy the timestamp before the borrow ends
+            // Check if the lock is stale (older than TTL)
+            if req.start_ts.saturating_sub(lock_ts_copy) <= TTL {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "lock conflict",
+                ));
+            }
+            // Lock is stale, clean it up and continue
+            if let Some(((_, stale_start_ts), _)) = table.read(req.key.clone(), Column::Data, None, None) {
+                let stale_start_ts_copy = *stale_start_ts;
+                table.erase(req.key.clone(), Column::Data, stale_start_ts_copy);
+            }
+            table.erase(req.key.clone(), Column::Lock, lock_ts_copy);
         }
         
         // Check for write conflict - if there's a write at timestamp > start_ts, abort
@@ -196,7 +206,23 @@ impl transaction::Service for MemoryStorage {
 
 impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
-        // Your code here.
-        unimplemented!()
+        let mut table = self.data.lock().unwrap();
+        
+        // Try to find the lock on this key
+        if let Some(((_, lock_ts), Value::Timestamp(lock_start_ts))) = 
+            table.read(key.clone(), Column::Lock, None, None) {
+            
+            let lock_ts_copy = *lock_ts;
+            let lock_start_ts_copy = *lock_start_ts;
+            
+            // Check if lock is stale (older than TTL)
+            if start_ts.saturating_sub(lock_ts_copy) > TTL {
+                // Lock is expired, clean it up
+                table.erase(key.clone(), Column::Lock, lock_ts_copy);
+                
+                // Also clean up the associated data that was written but not committed
+                table.erase(key, Column::Data, lock_start_ts_copy);
+            }
+        }
     }
 }
