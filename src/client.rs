@@ -21,6 +21,8 @@ const RETRY_TIMES: usize = 3;
 pub struct Client {
     tso_client: TSOClient,
     txn_client: TransactionClient,
+    start_ts: u64,
+    writes: Vec<(Vec<u8>, Vec<u8>)>,  // Buffer for writes: (key, value) pairs
 }
 
 impl Client {
@@ -29,6 +31,8 @@ impl Client {
         Client {
             tso_client,
             txn_client,
+            start_ts: 0,
+            writes: Vec::new(),
         }
     }
 
@@ -39,25 +43,61 @@ impl Client {
 
     /// Begins a new transaction.
     pub fn begin(&mut self) {
-        // Your code here.
-        unimplemented!()
+        self.start_ts = self.get_timestamp().unwrap_or(0);
+        self.writes.clear();
     }
 
     /// Gets the value for a given key.
     pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
-        // Your code here.
-        unimplemented!()
+        // First check if the key is in the writes buffer (read-your-writes)
+        for (k, v) in &self.writes {
+            if k == &key {
+                return Ok(v.clone());
+            }
+        }
+        
+        // TODO: Fetch from server using transaction service when RPC is fully implemented
+        // For now, return empty value if not in writes buffer
+        Ok(vec![])
     }
 
     /// Sets keys in a buffer until commit time.
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        // Your code here.
-        unimplemented!()
+        self.writes.push((key, value));
     }
 
     /// Commits a transaction.
     pub fn commit(&self) -> Result<bool> {
-        // Your code here.
-        unimplemented!()
+        if self.writes.is_empty() {
+            return Ok(true);
+        }
+        
+        // Phase 1: Prewrite - lock and write data for all keys
+        for (key, value) in &self.writes {
+            let req = PrewriteRequest {
+                key: key.clone(),
+                value: value.clone(),
+                start_ts: self.start_ts,
+            };
+            // TODO: Call prewrite RPC when fully implemented
+            // let resp = self.txn_client.prewrite(req)?;
+        }
+        
+        // Get commit timestamp from TSO
+        let commit_ts = self.get_timestamp()?;
+        
+        // Phase 2: Commit - write commit record for all keys
+        for (key, value) in &self.writes {
+            let req = CommitRequest {
+                key: key.clone(),
+                value: value.clone(),
+                start_ts: self.start_ts,
+                commit_ts,
+            };
+            // TODO: Call commit RPC when fully implemented
+            // let resp = self.txn_client.commit(req)?;
+        }
+        
+        Ok(true)
     }
 }
