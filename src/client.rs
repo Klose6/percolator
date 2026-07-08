@@ -1,6 +1,7 @@
 use labrpc::*;
 
-use crate::service::{TSOClient, TransactionClient};
+use crate::{server::TimestampOracle, service::{TSOClient, TransactionClient, timestamp, transaction}};
+use crate::msg::*;
 
 // BACKOFF_TIME_MS is the wait time before retrying to send the request.
 // It should be exponential growth. e.g.
@@ -18,20 +19,22 @@ const RETRY_TIMES: usize = 3;
 /// The other is do the transaction logic.
 #[derive(Clone)]
 pub struct Client {
-    // Your definitions here.
+    tso_client: TSOClient,
+    txn_client: TransactionClient,
 }
 
 impl Client {
     /// Creates a new Client.
     pub fn new(tso_client: TSOClient, txn_client: TransactionClient) -> Client {
-        // Your code here.
-        Client {}
+        Client {
+            tso_client,
+            txn_client,
+        }
     }
 
     /// Gets a timestamp from a TSO.
     pub fn get_timestamp(&self) -> Result<u64> {
-        // Your code here.
-        unimplemented!()
+        timestamp::get_timestamp()
     }
 
     /// Begins a new transaction.
