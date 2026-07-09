@@ -50,7 +50,8 @@ impl Client {
     /// Gets the value for a given key.
     pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
         // First check if the key is in the writes buffer (read-your-writes)
-        for (k, v) in &self.writes {
+        // Return the LAST (most recent) value for this key
+        for (k, v) in self.writes.iter().rev() {
             if k == &key {
                 return Ok(v.clone());
             }
