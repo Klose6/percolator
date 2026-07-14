@@ -47,6 +47,9 @@ mod integration_tests {
         // Both should be Ok
         assert!(ts1.is_ok());
         assert!(ts2.is_ok());
+
+        // Timestamps should be sequential
+        assert_eq!(ts1.unwrap() + 1, ts2.unwrap(), "timestamps should be sequential");
     }
 
     #[test]
@@ -80,5 +83,60 @@ mod integration_tests {
         let val = client.get(b"key".to_vec()).unwrap();
         // Should get the latest value
         assert_eq!(val, b"value2");
+    }
+
+    #[test]
+    fn test_concurrent_commits() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::thread;
+
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = vec![];
+
+        // Spawn 5 concurrent transactions
+        for i in 0..5 {
+            let results_clone = Arc::clone(&results);
+            
+            let handle = thread::spawn(move || {
+                let tso_client = TSOClient::new();
+                let txn_client = TransactionClient::new();
+                let mut client = Client::new(tso_client, txn_client);
+                
+                // Each transaction commits different keys
+                client.begin();
+                
+                let key = format!("key{}", i).into_bytes();
+                let value = format!("value{}", i).into_bytes();
+                
+                client.set(key.clone(), value.clone());
+                
+                // Verify we can read our own write
+                let val = client.get(key).unwrap();
+                assert_eq!(val, value, "Transaction {} should read its own write", i);
+                
+                // Commit the transaction
+                let commit_result = client.commit().unwrap();
+                
+                // Store the result
+                let mut res = results_clone.lock().unwrap();
+                res.push((i, commit_result));
+            });
+            
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Verify all commits succeeded
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 5, "All 5 transactions should complete");
+        
+        for (_, commit_result) in results.iter() {
+            assert!(*commit_result, "All commits should succeed");
+        }
     }
 }
