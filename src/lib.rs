@@ -21,6 +21,7 @@ macro_rules! service {
                 pub fn new() -> Self {
                     Self
                 }
+                pub async fn get_timestamp(&self) -> Result<u64> {{}
             }
 
             pub fn add_service<S: Service + 'static>(_service: S) {}

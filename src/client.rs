@@ -38,12 +38,14 @@ impl Client {
 
     /// Gets a timestamp from a TSO.
     pub fn get_timestamp(&self) -> Result<u64> {
-        timestamp::get_timestamp()
+        self.tso_client.get_timestamp(TimestampRequest {}).await
+            .map(|resp| resp.timestamp)
+            .map_err(|e| e.into())
     }
 
     /// Begins a new transaction.
     pub fn begin(&mut self) {
-        self.start_ts = self.get_timestamp().unwrap_or(0);
+        self.start_ts = self.get_timestamp()?;
         self.writes.clear();
     }
 
