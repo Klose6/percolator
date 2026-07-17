@@ -79,8 +79,9 @@ mod integration_tests {
         let results = Arc::new(Mutex::new(Vec::new()));
         let tso = TimestampOracle::new();
         let mut handles = vec![];
+        let num_transactions = 10;
 
-        for i in 0..5 {
+        for i in 0..num_transactions {
             let results_clone = Arc::clone(&results);
             let tso = tso.clone();
 
@@ -113,7 +114,7 @@ mod integration_tests {
         }
 
         let results = results.lock().unwrap();
-        assert_eq!(results.len(), 5, "All 5 transactions should complete");
+        assert_eq!(results.len(), num_transactions, "All {num_transactions} transactions should complete");
 
         for (_, commit_result) in results.iter() {
             assert!(*commit_result, "All commits should succeed");
