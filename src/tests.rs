@@ -71,7 +71,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_concurrent_commits() {
+    fn test_concurrent_commits_diff_keys() {
         use std::sync::Arc;
         use std::sync::Mutex;
         use std::thread;
@@ -99,6 +99,58 @@ mod integration_tests {
 
                 let val = client.get(key).unwrap();
                 assert_eq!(val, value, "Transaction {} should read its own write", i);
+
+                let commit_result = client.commit().unwrap();
+
+                let mut res = results_clone.lock().unwrap();
+                res.push((i, commit_result));
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), num_transactions, "All {num_transactions} transactions should complete");
+
+        for (_, commit_result) in results.iter() {
+            assert!(*commit_result, "All commits should succeed");
+        }
+    }
+
+    #[test]
+    fn test_concurrent_commits_same_keys() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::thread;
+
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let tso = TimestampOracle::new();
+        let mut handles = vec![];
+        let num_transactions = 10;
+        let key = b"test_key".to_vec();
+
+        for i in 0..num_transactions {
+            let results_clone = Arc::clone(&results);
+            let tso = tso.clone();
+            let key = key.clone();
+
+            let handle = thread::spawn( move || {
+                let tso_client = TSOClient::with_service(tso);
+                let txn_client = TransactionClient::new();
+                let mut client = Client::new(tso_client, txn_client);
+
+                client.begin();
+
+                let value = format!("value{}", i).into_bytes();
+
+                client.set(key.clone(), value.to_vec());
+
+                let val = client.get(key.clone()).unwrap();
+                assert_eq!(val, value.to_vec(), "Transaction {} should read its own write", i);
 
                 let commit_result = client.commit().unwrap();
 
