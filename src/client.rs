@@ -1,6 +1,6 @@
 use labrpc::*;
 
-use crate::{server::TimestampOracle, service::{TSOClient, TransactionClient, timestamp, transaction}};
+use crate::service::{TSOClient, TransactionClient};
 use crate::msg::*;
 
 // BACKOFF_TIME_MS is the wait time before retrying to send the request.
@@ -38,12 +38,14 @@ impl Client {
 
     /// Gets a timestamp from a TSO.
     pub fn get_timestamp(&self) -> Result<u64> {
-        self.tso_client.get_timestamp(TimestampRequest {}).map(|resp| resp.timestamp)
+        self.tso_client
+            .get_timestamp(TimestampRequest {})
+            .map(|resp| resp.timestamp)
     }
 
     /// Begins a new transaction.
     pub fn begin(&mut self) {
-        self.start_ts = self.get_timestamp()?;
+        self.start_ts = self.get_timestamp().unwrap_or(0);
         self.writes.clear();
     }
 

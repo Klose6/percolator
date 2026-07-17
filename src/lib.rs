@@ -6,6 +6,8 @@ pub type Result<T> = std::io::Result<T>;
 macro_rules! service {
     (service $service_name:ident { $(rpc $method:ident($req:ty) returns ($res:ty);)* }) => {
         pub mod $service_name {
+            use std::sync::Arc;
+
             use crate::msg::*;
             use crate::Result;
 
@@ -14,21 +16,38 @@ macro_rules! service {
                 $(async fn $method(&self, _req: $req) -> Result<$res>;)*
             }
 
+            /// RPC client stub. Bind a [`Service`] implementation so calls reach the server.
             #[derive(Clone, Default)]
-            pub struct Client;
+            pub struct Client {
+                service: Option<Arc<dyn Service>>,
+            }
 
             impl Client {
                 pub fn new() -> Self {
-                    Self
+                    Self { service: None }
                 }
-                pub async fn get_timestamp(&self) -> Result<u64> {{}
+
+                /// Attach the server-side service this client should call.
+                pub fn with_service<S: Service + 'static>(service: S) -> Self {
+                    Self {
+                        service: Some(Arc::new(service)),
+                    }
+                }
+
+                $(
+                pub fn $method(&self, req: $req) -> Result<$res> {
+                    let service = self.service.as_ref().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            concat!(stringify!($method), ": no service bound"),
+                        )
+                    })?;
+                    futures::executor::block_on(service.$method(req))
+                }
+                )*
             }
 
             pub fn add_service<S: Service + 'static>(_service: S) {}
-
-            $(pub fn $method() -> Result<u64> {
-                Ok(0)
-            })*
         }
     };
 }
