@@ -130,26 +130,41 @@ pub struct MemoryStorage {
 
 #[async_trait::async_trait]
 impl transaction::Service for MemoryStorage {
-    // example get RPC handler.
     async fn get(&self, req: GetRequest) -> labrpc::Result<GetResponse> {
+        // Try to clear a stale lock first (no-op if unlocked / still fresh).
+        self.back_off_maybe_clean_up_lock(req.start_ts, req.key.clone());
+
         let table = self.data.lock().unwrap();
-        let value = table.read(req.key, Column::Data, None, Some(u64::MAX));
-    
-        let response = match value {
-            Some((_, Value::Vector(v))) => GetResponse { value: v.clone() },
-            _ => GetResponse { value: vec![] },
-        };
-        
-        Ok(response)
+        // Fresh lock still present — client should back off and retry.
+        if table
+            .read(req.key.clone(), Column::Lock, None, None)
+            .is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "key is locked",
+            ));
+        }
+
+        // Snapshot read: latest Write with commit_ts <= start_ts, then follow to Data.
+        match table.read(req.key.clone(), Column::Write, None, Some(req.start_ts)) {
+            Some((_, Value::Timestamp(data_ts))) => {
+                let data_ts = *data_ts;
+                match table.read(req.key, Column::Data, Some(data_ts), Some(data_ts)) {
+                    Some((_, Value::Vector(v))) => Ok(GetResponse { value: v.clone() }),
+                    _ => Ok(GetResponse { value: vec![] }),
+                }
+            }
+            _ => Ok(GetResponse { value: vec![] }),
+        }
     }
 
-    // example prewrite RPC handler.
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
         let mut table = self.data.lock().unwrap();
-   
+
         // Check for lock conflict - if any lock exists on this key, abort
         if let Some(((_, lock_ts), _)) = table.read(req.key.clone(), Column::Lock, None, None) {
-            let lock_ts_copy = *lock_ts; // Copy the timestamp before the borrow ends
+            let lock_ts_copy = *lock_ts;
             // Check if the lock is stale (older than TTL)
             if req.start_ts.saturating_sub(lock_ts_copy) <= TTL {
                 return Err(std::io::Error::new(
@@ -158,15 +173,14 @@ impl transaction::Service for MemoryStorage {
                 ));
             }
             // Lock is stale, clean it up and continue
-            if let Some(((_, stale_start_ts), _)) = table.read(req.key.clone(), Column::Data, None, None) {
-                let stale_start_ts_copy = *stale_start_ts;
-                table.erase(req.key.clone(), Column::Data, stale_start_ts_copy);
-            }
+            table.erase(req.key.clone(), Column::Data, lock_ts_copy);
             table.erase(req.key.clone(), Column::Lock, lock_ts_copy);
         }
-        
+
         // Check for write conflict - if there's a write at timestamp > start_ts, abort
-        if let Some(((_, write_ts), _)) = table.read(req.key.clone(), Column::Write, Some(req.start_ts + 1), None) {
+        if let Some(((_, write_ts), _)) =
+            table.read(req.key.clone(), Column::Write, Some(req.start_ts + 1), None)
+        {
             if *write_ts > req.start_ts {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -174,32 +188,49 @@ impl transaction::Service for MemoryStorage {
                 ));
             }
         }
-        
-        // No conflicts, write lock at start_ts
-        table.write(req.key.clone(), Column::Lock, req.start_ts, Value::Timestamp(req.start_ts));
-        
-        // Write data at start_ts
-        table.write(req.key, Column::Data, req.start_ts, Value::Vector(req.value));
-        
+
+        // No conflicts, write lock and data at start_ts
+        table.write(
+            req.key.clone(),
+            Column::Lock,
+            req.start_ts,
+            Value::Timestamp(req.start_ts),
+        );
+        table.write(
+            req.key,
+            Column::Data,
+            req.start_ts,
+            Value::Vector(req.value),
+        );
+
         Ok(PrewriteResponse {})
     }
 
-    // example commit RPC handler.
     async fn commit(&self, req: CommitRequest) -> labrpc::Result<CommitResponse> {
         let mut table = self.data.lock().unwrap();
-    
-        // Write a commit record to the Write column at commit_ts
-        // This makes the transaction's data visible to future readers
+
+        // Require the lock placed during prewrite.
+        if table
+            .read(
+                req.key.clone(),
+                Column::Lock,
+                Some(req.start_ts),
+                Some(req.start_ts),
+            )
+            .is_none()
+        {
+            return Ok(CommitResponse { ok: false });
+        }
+
+        // Write column at commit_ts points to the Data version at start_ts.
         table.write(
             req.key.clone(),
             Column::Write,
             req.commit_ts,
-            Value::Timestamp(req.commit_ts),
+            Value::Timestamp(req.start_ts),
         );
-        
-        // Remove the lock that was placed during prewrite
         table.erase(req.key, Column::Lock, req.start_ts);
-        
+
         Ok(CommitResponse { ok: true })
     }
 }

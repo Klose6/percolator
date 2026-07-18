@@ -7,6 +7,7 @@ message TimestampResponse {
 
 message GetRequest {
   bytes key = 1;
+  uint64 start_ts = 2;
 }
 
 message GetResponse {

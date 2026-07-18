@@ -1,7 +1,10 @@
+use std::thread;
+use std::time::Duration;
+
 use labrpc::*;
 
-use crate::service::{TSOClient, TransactionClient};
 use crate::msg::*;
+use crate::service::{TSOClient, TransactionClient};
 
 // BACKOFF_TIME_MS is the wait time before retrying to send the request.
 // It should be exponential growth. e.g.
@@ -22,7 +25,7 @@ pub struct Client {
     tso_client: TSOClient,
     txn_client: TransactionClient,
     start_ts: u64,
-    writes: Vec<(Vec<u8>, Vec<u8>)>,  // Buffer for writes: (key, value) pairs
+    writes: Vec<(Vec<u8>, Vec<u8>)>, // Buffer for writes: (key, value) pairs
 }
 
 impl Client {
@@ -52,16 +55,26 @@ impl Client {
     /// Gets the value for a given key.
     pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
         // First check if the key is in the writes buffer (read-your-writes)
-        // Return the LAST (most recent) value for this key
         for (k, v) in self.writes.iter().rev() {
             if k == &key {
                 return Ok(v.clone());
             }
         }
-        
-        // TODO: Fetch from server using transaction service when RPC is fully implemented
-        // For now, return empty value if not in writes buffer
-        Ok(vec![])
+
+        for i in 0..RETRY_TIMES {
+            match self.txn_client.get(GetRequest {
+                key: key.clone(),
+                start_ts: self.start_ts,
+            }) {
+                Ok(resp) => return Ok(resp.value),
+                Err(e) if i + 1 < RETRY_TIMES => {
+                    thread::sleep(Duration::from_millis(BACKOFF_TIME_MS << i));
+                    let _ = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
     }
 
     /// Sets keys in a buffer until commit time.
@@ -74,21 +87,41 @@ impl Client {
         if self.writes.is_empty() {
             return Ok(true);
         }
-        
+
         // Phase 1: Prewrite - lock and write data for all keys
         for (key, value) in &self.writes {
-            let req = PrewriteRequest {
-                key: key.clone(),
-                value: value.clone(),
-                start_ts: self.start_ts,
-            };
-            // TODO: Call prewrite RPC when fully implemented
-            // let resp = self.txn_client.prewrite(req)?;
+            let mut prewrote = false;
+            for i in 0..RETRY_TIMES {
+                let req = PrewriteRequest {
+                    key: key.clone(),
+                    value: value.clone(),
+                    start_ts: self.start_ts,
+                };
+                match self.txn_client.prewrite(req) {
+                    Ok(_) => {
+                        prewrote = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("write conflict") {
+                            return Ok(false);
+                        }
+                        if i + 1 == RETRY_TIMES {
+                            return Ok(false);
+                        }
+                        thread::sleep(Duration::from_millis(BACKOFF_TIME_MS << i));
+                    }
+                }
+            }
+            if !prewrote {
+                return Ok(false);
+            }
         }
-        
+
         // Get commit timestamp from TSO
         let commit_ts = self.get_timestamp()?;
-        
+
         // Phase 2: Commit - write commit record for all keys
         for (key, value) in &self.writes {
             let req = CommitRequest {
@@ -97,10 +130,12 @@ impl Client {
                 start_ts: self.start_ts,
                 commit_ts,
             };
-            // TODO: Call commit RPC when fully implemented
-            // let resp = self.txn_client.commit(req)?;
+            let resp = self.txn_client.commit(req)?;
+            if !resp.ok {
+                return Ok(false);
+            }
         }
-        
+
         Ok(true)
     }
 }
