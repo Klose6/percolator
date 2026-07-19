@@ -245,6 +245,26 @@ impl transaction::Service for MemoryStorage {
 
         Ok(CommitResponse { ok: true })
     }
+
+    /// Abort a staged prewrite: remove Lock and Data at `start_ts` if present.
+    async fn rollback(&self, req: RollbackRequest) -> labrpc::Result<RollbackResponse> {
+        let mut table = self.data.lock().unwrap();
+
+        if table
+            .read(
+                req.key.clone(),
+                Column::Lock,
+                Some(req.start_ts),
+                Some(req.start_ts),
+            )
+            .is_some()
+        {
+            table.erase(req.key.clone(), Column::Lock, req.start_ts);
+            table.erase(req.key, Column::Data, req.start_ts);
+        }
+
+        Ok(RollbackResponse {})
+    }
 }
 
 impl MemoryStorage {

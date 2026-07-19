@@ -14,12 +14,13 @@ labrpc::service! {
 /// Client stub for the TSO (`timestamp::Client`).
 pub use timestamp::Client as TSOClient;
 
-/// Transaction storage service: snapshot reads and 2PC (prewrite / commit).
+/// Transaction storage service: snapshot reads and 2PC (prewrite / commit / rollback).
 labrpc::service! {
     service transaction {
         rpc get(GetRequest) returns (GetResponse);
         rpc prewrite(PrewriteRequest) returns (PrewriteResponse);
         rpc commit(CommitRequest) returns (CommitResponse);
+        rpc rollback(RollbackRequest) returns (RollbackResponse);
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +17,8 @@ const RETRY_TIMES: usize = 3;
 ///
 /// Talks to the TSO for timestamps and to the transaction service for
 /// snapshot reads and 2PC (`prewrite` → `commit`). Writes are buffered
-/// locally until [`commit`](Self::commit).
+/// locally until [`commit`](Self::commit). Supports multiple distinct keys
+/// in one transaction; on abort, successful prewrites are rolled back.
 #[derive(Clone)]
 pub struct Client {
     tso_client: TSOClient,
@@ -84,21 +86,57 @@ impl Client {
         self.writes.push((key, value));
     }
 
-    /// Two-phase commit over all buffered writes.
+    /// Collapse duplicate keys so each key is prewritten once (last `set` wins).
+    fn coalesced_writes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut by_key: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        for (key, value) in &self.writes {
+            if !by_key.contains_key(key) {
+                order.push(key.clone());
+            }
+            by_key.insert(key.clone(), value.clone());
+        }
+        order
+            .into_iter()
+            .map(|k| {
+                let v = by_key.remove(&k).unwrap();
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// Best-effort unlock of keys that were prewritten but not committed.
+    fn rollback_prewrites(&self, keys: &[Vec<u8>]) {
+        for key in keys {
+            let _ = self.txn_client.rollback(RollbackRequest {
+                key: key.clone(),
+                start_ts: self.start_ts,
+            });
+        }
+    }
+
+    /// Two-phase commit over all buffered writes (multi-key supported).
     ///
-    /// 1. **Prewrite** each key (lock + stage Data at `start_ts`)
-    /// 2. Obtain `commit_ts` from TSO
-    /// 3. **Commit** each key (Write record + drop Lock)
+    /// 1. Coalesce writes (last value per key)
+    /// 2. **Prewrite** each key; on failure, rollback earlier prewrites
+    /// 3. Obtain `commit_ts` from TSO
+    /// 4. **Commit** each key; on failure, rollback keys not yet committed
     ///
-    /// Returns `Ok(false)` on write/lock conflict after retries; `Ok(true)` on success.
+    /// Without primary/secondary locks, keys already committed in step 4 stay
+    /// visible if a later key fails — documented limitation.
+    ///
+    /// Returns `Ok(false)` on conflict after retries; `Ok(true)` on success.
     pub fn commit(&self) -> Result<bool> {
         if self.writes.is_empty() {
             return Ok(true);
         }
 
+        let writes = self.coalesced_writes();
+        let mut prewritten: Vec<Vec<u8>> = Vec::new();
+
         // Phase 1: prewrite — lock keys and stage values.
-        for (key, value) in &self.writes {
-            let mut prewrote = false;
+        for (key, value) in &writes {
+            let mut ok = false;
             for i in 0..RETRY_TIMES {
                 let req = PrewriteRequest {
                     key: key.clone(),
@@ -107,42 +145,52 @@ impl Client {
                 };
                 match self.txn_client.prewrite(req) {
                     Ok(_) => {
-                        prewrote = true;
+                        ok = true;
                         break;
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        // Newer committed write — abort; retrying will not help.
-                        if msg.contains("write conflict") {
-                            return Ok(false);
-                        }
-                        // Likely lock conflict — back off and retry.
-                        if i + 1 == RETRY_TIMES {
+                        if msg.contains("write conflict") || i + 1 == RETRY_TIMES {
+                            self.rollback_prewrites(&prewritten);
                             return Ok(false);
                         }
                         thread::sleep(Duration::from_millis(BACKOFF_TIME_MS << i));
                     }
                 }
             }
-            if !prewrote {
+            if !ok {
+                self.rollback_prewrites(&prewritten);
                 return Ok(false);
             }
+            prewritten.push(key.clone());
         }
 
-        // Commit timestamp must be greater than start_ts (and all prior commits).
-        let commit_ts = self.get_timestamp()?;
+        let commit_ts = match self.get_timestamp() {
+            Ok(ts) => ts,
+            Err(e) => {
+                self.rollback_prewrites(&prewritten);
+                return Err(e);
+            }
+        };
 
         // Phase 2: commit — publish Write records and release locks.
-        for (key, value) in &self.writes {
+        let mut committed = 0usize;
+        for (key, value) in &writes {
             let req = CommitRequest {
                 key: key.clone(),
                 value: value.clone(),
                 start_ts: self.start_ts,
                 commit_ts,
             };
-            let resp = self.txn_client.commit(req)?;
-            if !resp.ok {
-                return Ok(false);
+            match self.txn_client.commit(req) {
+                Ok(resp) if resp.ok => {
+                    committed += 1;
+                }
+                Ok(_) | Err(_) => {
+                    // Roll back keys that still hold locks (not yet committed).
+                    self.rollback_prewrites(&prewritten[committed..]);
+                    return Ok(false);
+                }
             }
         }
 

@@ -18,7 +18,7 @@ mod integration_tests {
     fn test_basic_transaction() {
         let tso = TimestampOracle::new();
         let storage = MemoryStorage::default();
-        let mut client = make_client(tso, storage);
+        let mut client = make_client(tso.clone(), storage.clone());
 
         client.begin();
         client.set(b"key1".to_vec(), b"value1".to_vec());
@@ -32,6 +32,80 @@ mod integration_tests {
 
         let result = client.commit().unwrap();
         assert!(result, "commit should succeed");
+
+        // Durable multi-key read from storage after commit.
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"key1".to_vec()).unwrap(), b"value1");
+        assert_eq!(reader.get(b"key2".to_vec()).unwrap(), b"value2");
+    }
+
+    #[test]
+    fn test_multi_key_write_commit_and_read() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+
+        let mut writer = make_client(tso.clone(), storage.clone());
+        writer.begin();
+        writer.set(b"a".to_vec(), b"va".to_vec());
+        writer.set(b"b".to_vec(), b"vb".to_vec());
+        writer.set(b"c".to_vec(), b"vc".to_vec());
+        // Duplicate set: last value for `a` should win after coalesce.
+        writer.set(b"a".to_vec(), b"va2".to_vec());
+        assert!(writer.commit().unwrap());
+
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"a".to_vec()).unwrap(), b"va2");
+        assert_eq!(reader.get(b"b".to_vec()).unwrap(), b"vb");
+        assert_eq!(reader.get(b"c".to_vec()).unwrap(), b"vc");
+    }
+
+    #[test]
+    fn test_multi_key_prewrite_rollback() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+
+        // Hold a live lock on key2 so a multi-key txn fails on the second prewrite.
+        let blocker = TransactionClient::with_service(storage.clone());
+        let block_ts = {
+            let mut ts_client = make_client(tso.clone(), storage.clone());
+            ts_client.get_timestamp().unwrap()
+        };
+        blocker
+            .prewrite(crate::msg::PrewriteRequest {
+                key: b"key2".to_vec(),
+                value: b"blocked".to_vec(),
+                start_ts: block_ts,
+            })
+            .expect("blocker prewrite should succeed");
+
+        let mut client = make_client(tso.clone(), storage.clone());
+        client.begin();
+        client.set(b"key1".to_vec(), b"v1".to_vec());
+        client.set(b"key2".to_vec(), b"v2".to_vec());
+        assert!(
+            !client.commit().unwrap(),
+            "commit should fail due to lock on key2"
+        );
+
+        // key1 must not stay locked: a later writer should be able to commit it.
+        let mut writer = make_client(tso.clone(), storage.clone());
+        writer.begin();
+        writer.set(b"key1".to_vec(), b"ok".to_vec());
+        assert!(
+            writer.commit().unwrap(),
+            "key1 should be free after rollback"
+        );
+
+        // Failed txn must not have committed either key.
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"key1".to_vec()).unwrap(), b"ok");
+        assert!(
+            reader.get(b"key2".to_vec()).unwrap().is_empty(),
+            "key2 should have no committed value from the failed txn"
+        );
     }
 
     #[test]

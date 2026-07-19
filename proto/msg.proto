@@ -32,3 +32,11 @@ message CommitRequest {
 message CommitResponse {
   bool ok = 1;
 }
+
+message RollbackRequest {
+  bytes key = 1;
+  uint64 start_ts = 2;
+}
+
+message RollbackResponse {}
+
