@@ -1,12 +1,20 @@
+//! RPC service definitions for Percolator.
+//!
+//! Each `labrpc::service!` block expands into a module with:
+//! - `Service` — async trait implemented by the server
+//! - `Client` — sync stub; bind with `Client::with_service(...)` then call RPCs
 
+/// Timestamp Oracle (TSO) service: allocates strictly increasing timestamps.
 labrpc::service! {
     service timestamp {
         rpc get_timestamp(TimestampRequest) returns (TimestampResponse);
     }
 }
 
+/// Client stub for the TSO (`timestamp::Client`).
 pub use timestamp::Client as TSOClient;
 
+/// Transaction storage service: snapshot reads and 2PC (prewrite / commit).
 labrpc::service! {
     service transaction {
         rpc get(GetRequest) returns (GetResponse);
@@ -15,4 +23,5 @@ labrpc::service! {
     }
 }
 
+/// Client stub for MVCC storage (`transaction::Client`).
 pub use transaction::Client as TransactionClient;

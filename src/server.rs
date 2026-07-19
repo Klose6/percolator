@@ -6,11 +6,9 @@ use crate::msg::*;
 use crate::service::*;
 use crate::*;
 
-// TTL is used for a lock key.
-// If the key's lifetime exceeds this value, it should be cleaned up.
-// Otherwise, the operation should back off.
-/// It indicates how long a lock may live before another txn can treat it as abandoned and clean it up.
+/// How long a lock may live before another txn can treat it as abandoned and clean it up.
 /// Compared against timestamp differences (TSO values are nanosecond wall-clock based).
+/// If the lock is still within TTL, callers should back off instead of cleaning it up.
 const TTL: u64 = Duration::from_millis(100).as_nanos() as u64;
 
 /// Timestamp Oracle (TSO): hands out strictly increasing timestamps used as
