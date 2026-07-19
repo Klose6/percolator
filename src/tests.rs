@@ -89,7 +89,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_concurrent_commits_diff_keys() {
+    fn test_concurrent_one_key_write_diff_keys() {
         let results = Arc::new(Mutex::new(Vec::new()));
         let tso = TimestampOracle::new();
         let storage = MemoryStorage::default();
@@ -136,7 +136,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_concurrent_commits_same_keys() {
+    fn test_concurrent_one_key_write_same_key() {
         let results = Arc::new(Mutex::new(Vec::new()));
         let tso = TimestampOracle::new();
         let storage = MemoryStorage::default();
@@ -207,7 +207,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_parallel_reads_writes_same_key() {
+    fn test_parallel_reads_one_key_writes_same_key() {
         let tso = TimestampOracle::new();
         let storage = MemoryStorage::default();
         let key = b"shared".to_vec();
