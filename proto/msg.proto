@@ -18,6 +18,8 @@ message PrewriteRequest {
   bytes key = 1;
   bytes value = 2;
   uint64 start_ts = 3;
+  // Primary key of this transaction; empty means `key` itself is primary.
+  bytes primary = 4;
 }
 
 message PrewriteResponse {}

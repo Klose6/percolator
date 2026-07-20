@@ -17,13 +17,13 @@ const RETRY_TIMES: usize = 3;
 ///
 /// Talks to the TSO for timestamps and to the transaction service for
 /// snapshot reads and 2PC (`prewrite` → `commit`). Writes are buffered
-/// locally until [`commit`](Self::commit). Supports multiple distinct keys
+/// locally until commit. Supports multiple distinct keys
 /// in one transaction; on abort, successful prewrites are rolled back.
 #[derive(Clone)]
 pub struct Client {
     tso_client: TSOClient,
     txn_client: TransactionClient,
-    /// Snapshot timestamp for this txn; assigned in [`begin`](Self::begin).
+    /// Snapshot timestamp for this txn; assigned in transaction begin.
     start_ts: u64,
     /// Pending writes (key, value), applied only at commit via prewrite.
     writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -117,13 +117,13 @@ impl Client {
 
     /// Two-phase commit over all buffered writes (multi-key supported).
     ///
-    /// 1. Coalesce writes (last value per key)
-    /// 2. **Prewrite** each key; on failure, rollback earlier prewrites
+    /// 1. Coalesce writes (last value per key); first key is the txn **primary**
+    /// 2. **Prewrite** each key (Lock stores primary); on failure, rollback earlier prewrites
     /// 3. Obtain `commit_ts` from TSO
     /// 4. **Commit** each key; on failure, rollback keys not yet committed
     ///
-    /// Without primary/secondary locks, keys already committed in step 4 stay
-    /// visible if a later key fails — documented limitation.
+    /// Without committing primary first, keys already committed in step 4 may stay
+    /// visible if a later key fails — documented limitation until client orders commits.
     ///
     /// Returns `Ok(false)` on conflict after retries; `Ok(true)` on success.
     pub fn commit(&self) -> Result<bool> {
@@ -132,6 +132,7 @@ impl Client {
         }
 
         let writes = self.coalesced_writes();
+        let primary = writes[0].0.clone();
         let mut prewritten: Vec<Vec<u8>> = Vec::new();
 
         // Phase 1: prewrite — lock keys and stage values.
@@ -142,6 +143,7 @@ impl Client {
                     key: key.clone(),
                     value: value.clone(),
                     start_ts: self.start_ts,
+                    primary: primary.clone(),
                 };
                 match self.txn_client.prewrite(req) {
                     Ok(_) => {
@@ -186,6 +188,7 @@ impl Client {
                 Ok(resp) if resp.ok => {
                     committed += 1;
                 }
+                // Server rejected commit (ok: false), or the RPC itself failed.
                 Ok(_) | Err(_) => {
                     // Roll back keys that still hold locks (not yet committed).
                     self.rollback_prewrites(&prewritten[committed..]);

@@ -47,7 +47,7 @@ impl timestamp::Service for TimestampOracle {
 /// Bigtable-style row key: (user key, timestamp).
 pub type Key = (Vec<u8>, u64);
 
-/// Cell value: either a timestamp pointer (Write/Lock columns) or raw bytes (Data column).
+/// Cell value: timestamp pointer (Write column), raw bytes (Data), or primary key (Lock).
 #[derive(Clone, PartialEq)]
 pub enum Value {
     Timestamp(u64),
@@ -59,7 +59,8 @@ pub struct Write(Vec<u8>, Vec<u8>);
 
 /// Percolator stores each key across three columns:
 /// - **Data**: the actual value written at `start_ts` during prewrite
-/// - **Lock**: present while a txn has prewritten but not yet committed
+/// - **Lock**: present while a txn has prewritten but not yet committed;
+///   value is the txn's **primary key** bytes (`Value::Vector`)
 /// - **Write**: commit record at `commit_ts`; value points back to Data's `start_ts`
 pub enum Column {
     Write,
@@ -122,6 +123,20 @@ impl KvTable {
             Column::Lock => &mut self.lock,
         };
         map.remove(&(key, commit_ts));
+    }
+
+    /// Find the commit_ts of a Write on `key` whose value points at `data_ts` (start_ts).
+    fn find_write_commit_ts(&self, key: &[u8], data_ts: u64) -> Option<u64> {
+        self.write.iter().find_map(|((k, commit_ts), v)| {
+            if k.as_slice() == key {
+                if let Value::Timestamp(ts) = v {
+                    if *ts == data_ts {
+                        return Some(*commit_ts);
+                    }
+                }
+            }
+            None
+        })
     }
 }
 
@@ -199,12 +214,17 @@ impl transaction::Service for MemoryStorage {
             }
         }
 
-        // Stage: Lock marks the in-flight txn; Data holds the pending value.
+        // Stage: Lock stores the txn primary key; Data holds the pending value.
+        let primary = if req.primary.is_empty() {
+            req.key.clone()
+        } else {
+            req.primary.clone()
+        };
         table.write(
             req.key.clone(),
             Column::Lock,
             req.start_ts,
-            Value::Timestamp(req.start_ts),
+            Value::Vector(primary),
         );
         table.write(
             req.key,
@@ -268,21 +288,66 @@ impl transaction::Service for MemoryStorage {
 }
 
 impl MemoryStorage {
-    /// If `key` has a lock older than TTL relative to `start_ts`, erase that
-    /// Lock and its uncommitted Data so readers/writers can proceed.
+    /// Resolve a lock on `key` using Percolator primary/secondary rules.
+    ///
+    /// - Primary: erase Lock+Data only if stale (TTL).
+    /// - Secondary: if primary committed → commit this key; if primary gone →
+    ///   rollback; if primary still locked and fresh → leave for caller to retry.
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
         let mut table = self.data.lock().unwrap();
 
-        if let Some(((_, lock_ts), Value::Timestamp(lock_start_ts))) =
+        let Some(((_, lock_ts), Value::Vector(primary))) =
             table.read(key.clone(), Column::Lock, None, None)
-        {
-            let lock_ts_copy = *lock_ts;
-            let lock_start_ts_copy = *lock_start_ts;
+        else {
+            return;
+        };
+        let lock_ts = *lock_ts;
+        let primary = primary.clone();
 
-            if start_ts.saturating_sub(lock_ts_copy) > TTL {
-                table.erase(key.clone(), Column::Lock, lock_ts_copy);
-                table.erase(key, Column::Data, lock_start_ts_copy);
+        if primary == key {
+            // This row is the primary lock.
+            if start_ts.saturating_sub(lock_ts) > TTL {
+                table.erase(key.clone(), Column::Lock, lock_ts);
+                table.erase(key, Column::Data, lock_ts);
             }
+            return;
         }
+
+        // Secondary: follow the primary's outcome for this start_ts (`lock_ts`).
+        if let Some(commit_ts) = table.find_write_commit_ts(&primary, lock_ts) {
+            // Primary already committed — publish the same commit on this key.
+            table.write(
+                key.clone(),
+                Column::Write,
+                commit_ts,
+                Value::Timestamp(lock_ts),
+            );
+            table.erase(key, Column::Lock, lock_ts);
+            return;
+        }
+
+        let primary_still_locked = table
+            .read(
+                primary.clone(),
+                Column::Lock,
+                Some(lock_ts),
+                Some(lock_ts),
+            )
+            .is_some();
+
+        if primary_still_locked {
+            if start_ts.saturating_sub(lock_ts) > TTL {
+                // Stale primary — clean primary then roll back this secondary.
+                table.erase(primary.clone(), Column::Lock, lock_ts);
+                table.erase(primary, Column::Data, lock_ts);
+                table.erase(key.clone(), Column::Lock, lock_ts);
+                table.erase(key, Column::Data, lock_ts);
+            }
+            return;
+        }
+
+        // Primary has neither Lock nor matching Write → rolled back.
+        table.erase(key.clone(), Column::Lock, lock_ts);
+        table.erase(key, Column::Data, lock_ts);
     }
 }

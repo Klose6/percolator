@@ -77,6 +77,7 @@ mod integration_tests {
                 key: b"key2".to_vec(),
                 value: b"blocked".to_vec(),
                 start_ts: block_ts,
+                primary: b"key2".to_vec(),
             })
             .expect("blocker prewrite should succeed");
 
@@ -106,6 +107,111 @@ mod integration_tests {
             reader.get(b"key2".to_vec()).unwrap().is_empty(),
             "key2 should have no committed value from the failed txn"
         );
+    }
+
+    /// Commit only the primary; a later get on the secondary should resolve via
+    /// the primary Write and make the secondary value visible.
+    #[test]
+    fn test_secondary_resolves_after_primary_commit() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+        let txn = TransactionClient::with_service(storage.clone());
+
+        let start_ts = {
+            let c = make_client(tso.clone(), storage.clone());
+            c.get_timestamp().unwrap()
+        };
+        let primary = b"pk".to_vec();
+        let secondary = b"sk".to_vec();
+
+        txn.prewrite(crate::msg::PrewriteRequest {
+            key: primary.clone(),
+            value: b"pv".to_vec(),
+            start_ts,
+            primary: primary.clone(),
+        })
+        .unwrap();
+        txn.prewrite(crate::msg::PrewriteRequest {
+            key: secondary.clone(),
+            value: b"sv".to_vec(),
+            start_ts,
+            primary: primary.clone(),
+        })
+        .unwrap();
+
+        let commit_ts = {
+            let c = make_client(tso.clone(), storage.clone());
+            c.get_timestamp().unwrap()
+        };
+        // Commit primary only — leave secondary locked.
+        let resp = txn
+            .commit(crate::msg::CommitRequest {
+                key: primary.clone(),
+                value: b"pv".to_vec(),
+                start_ts,
+                commit_ts,
+            })
+            .unwrap();
+        assert!(resp.ok);
+
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(
+            reader.get(secondary).unwrap(),
+            b"sv",
+            "get should resolve secondary lock after primary commit"
+        );
+        assert_eq!(reader.get(primary).unwrap(), b"pv");
+    }
+
+    /// If the primary is rolled back, a get on the secondary should clear its
+    /// lock and not expose uncommitted data.
+    #[test]
+    fn test_secondary_rolls_back_when_primary_aborts() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+        let txn = TransactionClient::with_service(storage.clone());
+
+        let start_ts = {
+            let c = make_client(tso.clone(), storage.clone());
+            c.get_timestamp().unwrap()
+        };
+        let primary = b"pk".to_vec();
+        let secondary = b"sk".to_vec();
+
+        txn.prewrite(crate::msg::PrewriteRequest {
+            key: primary.clone(),
+            value: b"pv".to_vec(),
+            start_ts,
+            primary: primary.clone(),
+        })
+        .unwrap();
+        txn.prewrite(crate::msg::PrewriteRequest {
+            key: secondary.clone(),
+            value: b"sv".to_vec(),
+            start_ts,
+            primary: primary.clone(),
+        })
+        .unwrap();
+
+        txn.rollback(crate::msg::RollbackRequest {
+            key: primary.clone(),
+            start_ts,
+        })
+        .unwrap();
+
+        let mut reader = make_client(tso.clone(), storage.clone());
+        reader.begin();
+        assert!(
+            reader.get(secondary.clone()).unwrap().is_empty(),
+            "secondary must not be visible after primary rollback"
+        );
+
+        // Secondary lock should be gone so a new writer can commit.
+        let mut writer = make_client(tso, storage);
+        writer.begin();
+        writer.set(secondary, b"ok".to_vec());
+        assert!(writer.commit().unwrap());
     }
 
     #[test]
