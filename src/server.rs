@@ -158,7 +158,9 @@ impl transaction::Service for MemoryStorage {
         self.back_off_maybe_clean_up_lock(req.start_ts, req.key.clone());
 
         let table = self.data.lock().unwrap();
-        // Fresh lock still present — client should back off and retry.
+        /// Fresh lock still present — client should back off and retry. txn might still commit 
+        /// with commit_ts <= your start_ts. If you skipped the lock and only read Write, you could 
+        /// miss a version that belongs in your snapshot — or race with a commit that appears a moment later.
         if table
             .read(req.key.clone(), Column::Lock, None, None)
             .is_some()
@@ -291,8 +293,10 @@ impl MemoryStorage {
     /// Resolve a lock on `key` using Percolator primary/secondary rules.
     ///
     /// - Primary: erase Lock+Data only if stale (TTL).
-    /// - Secondary: if primary committed → commit this key; if primary gone →
-    ///   rollback; if primary still locked and fresh → leave for caller to retry.
+    /// - Secondary: 
+    ///     - if primary committed → commit this key; 
+    ///     - if primary gone → rollback; 
+    ///     - if primary still locked and fresh → leave for caller to retry.
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
         let mut table = self.data.lock().unwrap();
 
