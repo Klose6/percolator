@@ -7,37 +7,62 @@ use labrpc::*;
 use crate::msg::*;
 use crate::service::{TSOClient, TransactionClient};
 
-/// Base wait (ms) before retrying a failed RPC. Multiplied exponentially per attempt:
-/// attempt 1 → 100ms, attempt 2 → 200ms, attempt 3 → 400ms (`BACKOFF_TIME_MS << i`).
+/// Base wait (ms) before retrying a failed RPC. Multiplied exponentially per attempt.
 const BACKOFF_TIME_MS: u64 = 100;
-/// Max RPC attempts for lock-contention / transient failures on get and prewrite.
+/// Max RPC attempts for lock-contention / transient failures.
 const RETRY_TIMES: usize = 3;
 
-/// Percolator transaction client.
-///
-/// Talks to the TSO for timestamps and to the transaction service for
-/// snapshot reads and 2PC (`prewrite` → `commit`). Writes are buffered
-/// locally until commit. Supports multiple distinct keys
-/// in one transaction; on abort, successful prewrites are rolled back.
+/// Transaction locking mode (TiKV-style).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TxnMode {
+    /// Locks acquired only at prewrite (classic Percolator). Default.
+    #[default]
+    Optimistic,
+    /// Locks acquired on `set` / `lock_for_update` during execution.
+    Pessimistic,
+}
+
+/// Percolator transaction client (optimistic and pessimistic).
 #[derive(Clone)]
 pub struct Client {
     tso_client: TSOClient,
     txn_client: TransactionClient,
-    /// Snapshot timestamp for this txn; assigned in transaction begin.
+    mode: TxnMode,
+    /// Snapshot timestamp for this txn; assigned in [`begin`](Self::begin).
     start_ts: u64,
-    /// Pending writes (key, value), applied only at commit via prewrite.
+    /// Pending writes (key, value), applied at commit via prewrite.
     writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Keys locked early in pessimistic mode (may include keys not yet in `writes`).
+    locked_keys: Vec<Vec<u8>>,
+    /// Primary key for this txn (first locked or written key).
+    primary: Option<Vec<u8>>,
 }
 
 impl Client {
-    /// Creates a client bound to the given TSO and transaction RPC stubs.
+    /// Creates an **optimistic** client (locks at prewrite only).
     pub fn new(tso_client: TSOClient, txn_client: TransactionClient) -> Client {
+        Self::with_mode(tso_client, txn_client, TxnMode::Optimistic)
+    }
+
+    /// Creates a client with an explicit locking mode.
+    pub fn with_mode(
+        tso_client: TSOClient,
+        txn_client: TransactionClient,
+        mode: TxnMode,
+    ) -> Client {
         Client {
             tso_client,
             txn_client,
+            mode,
             start_ts: 0,
             writes: Vec::new(),
+            locked_keys: Vec::new(),
+            primary: None,
         }
+    }
+
+    pub fn mode(&self) -> TxnMode {
+        self.mode
     }
 
     /// Fetches a strictly increasing timestamp from the Timestamp Oracle.
@@ -47,18 +72,16 @@ impl Client {
             .map(|resp| resp.timestamp)
     }
 
-    /// Starts a transaction: take `start_ts` and clear the write buffer.
+    /// Starts a transaction: take `start_ts` and clear buffers / locks state.
     pub fn begin(&mut self) {
         self.start_ts = self.get_timestamp().unwrap_or(0);
         self.writes.clear();
+        self.locked_keys.clear();
+        self.primary = None;
     }
 
     /// Snapshot get at `start_ts`.
-    ///
-    /// Prefers the local write buffer (read-your-writes). Otherwise calls the
-    /// server `get` RPC, retrying with exponential backoff if the key is locked.
     pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
-        // Read-your-writes: latest buffered value for this key wins.
         for (k, v) in self.writes.iter().rev() {
             if k == &key {
                 return Ok(v.clone());
@@ -81,12 +104,57 @@ impl Client {
         unreachable!()
     }
 
-    /// Stages a write in the local buffer; nothing is sent until commit.
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    /// Buffer a write. In pessimistic mode, also acquires a lock immediately.
+    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        if self.mode == TxnMode::Pessimistic {
+            self.lock_for_update(key.clone())?;
+        }
         self.writes.push((key, value));
+        Ok(())
     }
 
-    /// Collapse duplicate keys so each key is prewritten once (last `set` wins).
+    /// Pessimistic `SELECT ... FOR UPDATE`: lock `key` now without writing a value.
+    pub fn lock_for_update(&mut self, key: Vec<u8>) -> Result<()> {
+        if self.mode != TxnMode::Pessimistic {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lock_for_update requires pessimistic mode",
+            ));
+        }
+        if self.locked_keys.iter().any(|k| k == &key) {
+            return Ok(());
+        }
+
+        let primary = self.primary.clone().unwrap_or_else(|| key.clone());
+        if self.primary.is_none() {
+            self.primary = Some(key.clone());
+        }
+
+        let for_update_ts = self.get_timestamp()?;
+        for i in 0..RETRY_TIMES {
+            let req = PessimisticLockRequest {
+                key: key.clone(),
+                start_ts: self.start_ts,
+                for_update_ts,
+                primary: primary.clone(),
+            };
+            match self.txn_client.pessimistic_lock(req) {
+                Ok(_) => {
+                    self.locked_keys.push(key);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("write conflict") || i + 1 == RETRY_TIMES {
+                        return Err(e);
+                    }
+                    thread::sleep(Duration::from_millis(BACKOFF_TIME_MS << i));
+                }
+            }
+        }
+        unreachable!()
+    }
+
     fn coalesced_writes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut by_key: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut order: Vec<Vec<u8>> = Vec::new();
@@ -105,8 +173,14 @@ impl Client {
             .collect()
     }
 
-    /// Best-effort unlock of keys that were prewritten but not committed.
-    fn rollback_prewrites(&self, keys: &[Vec<u8>]) {
+    fn txn_primary(&self, writes: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        self.primary
+            .clone()
+            .or_else(|| writes.first().map(|(k, _)| k.clone()))
+            .unwrap_or_default()
+    }
+
+    fn rollback_keys(&self, keys: &[Vec<u8>]) {
         for key in keys {
             let _ = self.txn_client.rollback(RollbackRequest {
                 key: key.clone(),
@@ -115,27 +189,21 @@ impl Client {
         }
     }
 
-    /// Two-phase commit over all buffered writes (multi-key supported).
-    ///
-    /// 1. Coalesce writes (last value per key); first key is the txn **primary**
-    /// 2. **Prewrite** each key (Lock stores primary); on failure, rollback earlier prewrites
-    /// 3. Obtain `commit_ts` from TSO
-    /// 4. **Commit** each key; on failure, rollback keys not yet committed
-    ///
-    /// Without committing primary first, keys already committed in step 4 may stay
-    /// visible if a later key fails — documented limitation until client orders commits.
-    ///
-    /// Returns `Ok(false)` on conflict after retries; `Ok(true)` on success.
+    /// Two-phase commit. Optimistic: lock at prewrite. Pessimistic: downgrade
+    /// existing locks and write Data at prewrite, then commit.
     pub fn commit(&self) -> Result<bool> {
         if self.writes.is_empty() {
+            // Pessimistic locks without writes: just release them.
+            if !self.locked_keys.is_empty() {
+                self.rollback_keys(&self.locked_keys);
+            }
             return Ok(true);
         }
 
         let writes = self.coalesced_writes();
-        let primary = writes[0].0.clone();
+        let primary = self.txn_primary(&writes);
         let mut prewritten: Vec<Vec<u8>> = Vec::new();
 
-        // Phase 1: prewrite — lock keys and stage values.
         for (key, value) in &writes {
             let mut ok = false;
             for i in 0..RETRY_TIMES {
@@ -153,7 +221,15 @@ impl Client {
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("write conflict") || i + 1 == RETRY_TIMES {
-                            self.rollback_prewrites(&prewritten);
+                            self.rollback_keys(&prewritten);
+                            // Also release pessimistic locks not yet prewritten.
+                            let extra: Vec<_> = self
+                                .locked_keys
+                                .iter()
+                                .filter(|k| !prewritten.contains(k))
+                                .cloned()
+                                .collect();
+                            self.rollback_keys(&extra);
                             return Ok(false);
                         }
                         thread::sleep(Duration::from_millis(BACKOFF_TIME_MS << i));
@@ -161,7 +237,7 @@ impl Client {
                 }
             }
             if !ok {
-                self.rollback_prewrites(&prewritten);
+                self.rollback_keys(&prewritten);
                 return Ok(false);
             }
             prewritten.push(key.clone());
@@ -170,14 +246,20 @@ impl Client {
         let commit_ts = match self.get_timestamp() {
             Ok(ts) => ts,
             Err(e) => {
-                self.rollback_prewrites(&prewritten);
+                self.rollback_keys(&prewritten);
                 return Err(e);
             }
         };
 
-        // Phase 2: commit — publish Write records and release locks.
-        let mut committed = 0usize;
-        for (key, value) in &writes {
+        // Commit primary first when it appears in the write set.
+        let mut ordered = writes.clone();
+        if let Some(pos) = ordered.iter().position(|(k, _)| k == &primary) {
+            ordered.swap(0, pos);
+        }
+
+        let mut remaining: Vec<Vec<u8>> =
+            ordered.iter().map(|(k, _)| k.clone()).collect();
+        for (key, value) in &ordered {
             let req = CommitRequest {
                 key: key.clone(),
                 value: value.clone(),
@@ -186,12 +268,10 @@ impl Client {
             };
             match self.txn_client.commit(req) {
                 Ok(resp) if resp.ok => {
-                    committed += 1;
+                    remaining.retain(|k| k != key);
                 }
-                // Server rejected commit (ok: false), or the RPC itself failed.
                 Ok(_) | Err(_) => {
-                    // Roll back keys that still hold locks (not yet committed).
-                    self.rollback_prewrites(&prewritten[committed..]);
+                    self.rollback_keys(&remaining);
                     return Ok(false);
                 }
             }

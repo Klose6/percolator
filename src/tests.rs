@@ -4,7 +4,7 @@ mod integration_tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use crate::client::Client;
+    use crate::client::{Client, TxnMode};
     use crate::msg::PrewriteRequest;
     use crate::server::{MemoryStorage, TimestampOracle};
     use crate::service::{TSOClient, TransactionClient};
@@ -13,6 +13,12 @@ mod integration_tests {
         let tso_client = TSOClient::with_service(tso);
         let txn_client = TransactionClient::with_service(storage);
         Client::new(tso_client, txn_client)
+    }
+
+    fn make_pessimistic_client(tso: TimestampOracle, storage: MemoryStorage) -> Client {
+        let tso_client = TSOClient::with_service(tso);
+        let txn_client = TransactionClient::with_service(storage);
+        Client::with_mode(tso_client, txn_client, TxnMode::Pessimistic)
     }
 
     /// Place a live lock on `key` so another txn's prewrite on that key fails.
@@ -62,11 +68,11 @@ mod integration_tests {
         let mut client = make_client(TimestampOracle::new(), MemoryStorage::default());
 
         client.begin();
-        client.set(b"key".to_vec(), b"value1".to_vec());
+        client.set(b"key".to_vec(), b"value1".to_vec()).unwrap();
         let val = client.get(b"key".to_vec()).unwrap();
         assert_eq!(val, b"value1");
 
-        client.set(b"key".to_vec(), b"value2".to_vec());
+        client.set(b"key".to_vec(), b"value2".to_vec()).unwrap();
         let val = client.get(b"key".to_vec()).unwrap();
         assert_eq!(val, b"value2");
     }
@@ -78,7 +84,7 @@ mod integration_tests {
 
         let mut writer = make_client(tso.clone(), storage.clone());
         writer.begin();
-        writer.set(b"k".to_vec(), b"v1".to_vec());
+        writer.set(b"k".to_vec(), b"v1".to_vec()).unwrap();
         assert!(writer.commit().unwrap());
 
         let mut reader = make_client(tso, storage);
@@ -106,7 +112,7 @@ mod integration_tests {
                 client.begin();
                 let key = format!("key{}", i).into_bytes();
                 let value = format!("value{}", i).into_bytes();
-                client.set(key.clone(), value.clone());
+                client.set(key.clone(), value.clone()).unwrap();
 
                 let val = client.get(key).unwrap();
                 assert_eq!(val, value, "Transaction {} should read its own write", i);
@@ -154,7 +160,7 @@ mod integration_tests {
 
                 client.begin();
                 let value = format!("value{}", i).into_bytes();
-                client.set(key.clone(), value.clone());
+                client.set(key.clone(), value.clone()).unwrap();
 
                 let val = client.get(key).unwrap();
                 assert_eq!(
@@ -215,7 +221,7 @@ mod integration_tests {
         {
             let mut seeder = make_client(tso.clone(), storage.clone());
             seeder.begin();
-            seeder.set(key.clone(), seed.clone());
+            seeder.set(key.clone(), seed.clone()).unwrap();
             assert!(seeder.commit().unwrap(), "seed commit should succeed");
         }
 
@@ -236,7 +242,7 @@ mod integration_tests {
                 let mut client = make_client(tso, storage);
                 client.begin();
                 let value = format!("vw{}", i).into_bytes();
-                client.set(key, value.clone());
+                client.set(key, value.clone()).unwrap();
                 if client.commit().unwrap() {
                     committed.lock().unwrap().insert(value);
                 }
@@ -292,8 +298,8 @@ mod integration_tests {
         let mut client = make_client(tso.clone(), storage.clone());
 
         client.begin();
-        client.set(b"key1".to_vec(), b"value1".to_vec());
-        client.set(b"key2".to_vec(), b"value2".to_vec());
+        client.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+        client.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
         assert_eq!(client.get(b"key1".to_vec()).unwrap(), b"value1");
         assert_eq!(client.get(b"key2".to_vec()).unwrap(), b"value2");
@@ -312,11 +318,11 @@ mod integration_tests {
 
         let mut writer = make_client(tso.clone(), storage.clone());
         writer.begin();
-        writer.set(b"a".to_vec(), b"va".to_vec());
-        writer.set(b"b".to_vec(), b"vb".to_vec());
-        writer.set(b"c".to_vec(), b"vc".to_vec());
+        writer.set(b"a".to_vec(), b"va".to_vec()).unwrap();
+        writer.set(b"b".to_vec(), b"vb".to_vec()).unwrap();
+        writer.set(b"c".to_vec(), b"vc".to_vec()).unwrap();
         // Duplicate set: last value for `a` should win after coalesce.
-        writer.set(b"a".to_vec(), b"va2".to_vec());
+        writer.set(b"a".to_vec(), b"va2".to_vec()).unwrap();
         assert!(writer.commit().unwrap());
 
         let mut reader = make_client(tso, storage);
@@ -335,8 +341,8 @@ mod integration_tests {
 
         let mut client = make_client(tso.clone(), storage.clone());
         client.begin();
-        client.set(b"key1".to_vec(), b"v1".to_vec());
-        client.set(b"key2".to_vec(), b"v2".to_vec());
+        client.set(b"key1".to_vec(), b"v1".to_vec()).unwrap();
+        client.set(b"key2".to_vec(), b"v2".to_vec()).unwrap();
         assert!(
             !client.commit().unwrap(),
             "commit should fail due to lock on key2"
@@ -344,7 +350,7 @@ mod integration_tests {
 
         let mut writer = make_client(tso.clone(), storage.clone());
         writer.begin();
-        writer.set(b"key1".to_vec(), b"ok".to_vec());
+        writer.set(b"key1".to_vec(), b"ok".to_vec()).unwrap();
         assert!(
             writer.commit().unwrap(),
             "key1 should be free after rollback"
@@ -455,7 +461,7 @@ mod integration_tests {
 
         let mut writer = make_client(tso, storage);
         writer.begin();
-        writer.set(secondary, b"ok".to_vec());
+        writer.set(secondary, b"ok".to_vec()).unwrap();
         assert!(writer.commit().unwrap());
     }
 
@@ -475,9 +481,9 @@ mod integration_tests {
             let storage = MemoryStorage::default();
             let mut client = make_client(tso.clone(), storage.clone());
             client.begin();
-            client.set(k1.clone(), b"v1".to_vec());
-            client.set(k2.clone(), b"v2".to_vec());
-            client.set(k3.clone(), b"v3".to_vec());
+            client.set(k1.clone(), b"v1".to_vec()).unwrap();
+            client.set(k2.clone(), b"v2".to_vec()).unwrap();
+            client.set(k3.clone(), b"v3".to_vec()).unwrap();
             assert!(client.commit().unwrap(), "all three keys should commit");
 
             let mut reader = make_client(tso, storage);
@@ -495,9 +501,9 @@ mod integration_tests {
 
             let mut client = make_client(tso.clone(), storage.clone());
             client.begin();
-            client.set(k1.clone(), b"a1".to_vec());
-            client.set(k2.clone(), b"a2".to_vec());
-            client.set(k3.clone(), b"a3".to_vec());
+            client.set(k1.clone(), b"a1".to_vec()).unwrap();
+            client.set(k2.clone(), b"a2".to_vec()).unwrap();
+            client.set(k3.clone(), b"a3".to_vec()).unwrap();
             assert!(
                 !client.commit().unwrap(),
                 "commit should fail when 2nd key is locked"
@@ -511,7 +517,7 @@ mod integration_tests {
             // Primary must be unlocked after rollback.
             let mut writer = make_client(tso, storage);
             writer.begin();
-            writer.set(k1.clone(), b"ok1".to_vec());
+            writer.set(k1.clone(), b"ok1".to_vec()).unwrap();
             assert!(writer.commit().unwrap());
         }
 
@@ -523,9 +529,9 @@ mod integration_tests {
 
             let mut client = make_client(tso.clone(), storage.clone());
             client.begin();
-            client.set(k1.clone(), b"b1".to_vec());
-            client.set(k2.clone(), b"b2".to_vec());
-            client.set(k3.clone(), b"b3".to_vec());
+            client.set(k1.clone(), b"b1".to_vec()).unwrap();
+            client.set(k2.clone(), b"b2".to_vec()).unwrap();
+            client.set(k3.clone(), b"b3".to_vec()).unwrap();
             assert!(
                 !client.commit().unwrap(),
                 "commit should fail when 3rd key is locked"
@@ -545,9 +551,88 @@ mod integration_tests {
             // Earlier keys must be free for a new writer.
             let mut writer = make_client(tso, storage);
             writer.begin();
-            writer.set(k1, b"ok1".to_vec());
-            writer.set(k2, b"ok2".to_vec());
+            writer.set(k1, b"ok1".to_vec()).unwrap();
+            writer.set(k2, b"ok2".to_vec()).unwrap();
             assert!(writer.commit().unwrap());
         }
+    }
+
+    // --- Optimistic vs pessimistic locking ---
+
+    #[test]
+    fn test_optimistic_locks_only_at_prewrite() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+
+        let mut a = make_client(tso.clone(), storage.clone());
+        a.begin();
+        a.set(b"k".to_vec(), b"from-a".to_vec()).unwrap();
+        // Not committed yet — another optimistic txn can still buffer a write locally.
+        let mut b = make_client(tso.clone(), storage.clone());
+        b.begin();
+        b.set(b"k".to_vec(), b"from-b".to_vec()).unwrap();
+
+        assert!(a.commit().unwrap());
+        // b should lose at prewrite (write conflict or lock).
+        assert!(!b.commit().unwrap());
+
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"k".to_vec()).unwrap(), b"from-a");
+    }
+
+    #[test]
+    fn test_pessimistic_locks_on_set() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+
+        let mut holder = make_pessimistic_client(tso.clone(), storage.clone());
+        holder.begin();
+        holder.set(b"k".to_vec(), b"held".to_vec()).unwrap();
+        // Lock is already on the server — second pessimistic txn cannot lock.
+        let mut other = make_pessimistic_client(tso.clone(), storage.clone());
+        other.begin();
+        let err = other.set(b"k".to_vec(), b"other".to_vec());
+        assert!(err.is_err(), "second pessimistic set should fail while key is locked");
+
+        assert!(holder.commit().unwrap());
+
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"k".to_vec()).unwrap(), b"held");
+    }
+
+    #[test]
+    fn test_pessimistic_lock_for_update_then_set() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+
+        let mut client = make_pessimistic_client(tso.clone(), storage.clone());
+        client.begin();
+        client.lock_for_update(b"k".to_vec()).unwrap();
+        // Value written later; lock already held.
+        client.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+        assert!(client.commit().unwrap());
+
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"k".to_vec()).unwrap(), b"v");
+    }
+
+    #[test]
+    fn test_pessimistic_multi_key_commit() {
+        let tso = TimestampOracle::new();
+        let storage = MemoryStorage::default();
+
+        let mut client = make_pessimistic_client(tso.clone(), storage.clone());
+        client.begin();
+        client.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        client.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        assert!(client.commit().unwrap());
+
+        let mut reader = make_client(tso, storage);
+        reader.begin();
+        assert_eq!(reader.get(b"a".to_vec()).unwrap(), b"1");
+        assert_eq!(reader.get(b"b".to_vec()).unwrap(), b"2");
     }
 }

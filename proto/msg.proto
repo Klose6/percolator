@@ -42,3 +42,13 @@ message RollbackRequest {
 
 message RollbackResponse {}
 
+// Acquire a pessimistic lock during statement execution (TiKV-style).
+// Conflict check uses for_update_ts; lock is stored at start_ts.
+message PessimisticLockRequest {
+  bytes key = 1;
+  uint64 start_ts = 2;
+  uint64 for_update_ts = 3;
+  bytes primary = 4;
+}
+
+message PessimisticLockResponse {}
