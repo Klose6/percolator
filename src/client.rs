@@ -105,9 +105,13 @@ impl Client {
     }
 
     /// Buffer a write. In pessimistic mode, also acquires a lock immediately.
+    /// On lock failure, aborts the txn (releases prior pessimistic locks).
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         if self.mode == TxnMode::Pessimistic {
-            self.lock_for_update(key.clone())?;
+            if let Err(e) = self.lock_for_update(key.clone()) {
+                self.abort();
+                return Err(e);
+            }
         }
         self.writes.push((key, value));
         Ok(())
@@ -153,6 +157,23 @@ impl Client {
             }
         }
         unreachable!()
+    }
+
+    /// Release all pessimistic/prewrite locks for this txn and clear local buffers.
+    pub fn abort(&mut self) {
+        self.rollback_keys(&self.locked_keys);
+        // Also roll back any keys only present in the write buffer (optimistic path).
+        for (key, _) in self.coalesced_writes() {
+            if !self.locked_keys.contains(&key) {
+                let _ = self.txn_client.rollback(RollbackRequest {
+                    key,
+                    start_ts: self.start_ts,
+                });
+            }
+        }
+        self.writes.clear();
+        self.locked_keys.clear();
+        self.primary = None;
     }
 
     fn coalesced_writes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {

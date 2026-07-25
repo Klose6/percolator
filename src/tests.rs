@@ -635,4 +635,94 @@ mod integration_tests {
         assert_eq!(reader.get(b"a".to_vec()).unwrap(), b"1");
         assert_eq!(reader.get(b"b".to_vec()).unwrap(), b"2");
     }
+
+    /// Pessimistic three-key scenarios (mirrors optimistic multi-key rollback tests):
+    /// 1) all three keys commit successfully
+    /// 2) primary locked, 2nd key fails → abort/rollback
+    /// 3) primary + 2nd locked, 3rd fails → abort/rollback
+    #[test]
+    fn test_pessimistic_three_key_write_success_and_rollback() {
+        let k1 = b"pk1".to_vec();
+        let k2 = b"pk2".to_vec();
+        let k3 = b"pk3".to_vec();
+
+        // --- 1) Write all 3 keys in one pessimistic transaction and succeed ---
+        {
+            let tso = TimestampOracle::new();
+            let storage = MemoryStorage::default();
+            let mut client = make_pessimistic_client(tso.clone(), storage.clone());
+            client.begin();
+            client.set(k1.clone(), b"v1".to_vec()).unwrap();
+            client.set(k2.clone(), b"v2".to_vec()).unwrap();
+            client.set(k3.clone(), b"v3".to_vec()).unwrap();
+            assert!(client.commit().unwrap(), "all three keys should commit");
+
+            let mut reader = make_client(tso, storage);
+            reader.begin();
+            assert_eq!(reader.get(k1.clone()).unwrap(), b"v1");
+            assert_eq!(reader.get(k2.clone()).unwrap(), b"v2");
+            assert_eq!(reader.get(k3.clone()).unwrap(), b"v3");
+        }
+
+        // --- 2) Primary locks, 2nd key conflicts → auto-abort, nothing committed ---
+        {
+            let tso = TimestampOracle::new();
+            let storage = MemoryStorage::default();
+            block_key(&tso, &storage, &k2);
+
+            let mut client = make_pessimistic_client(tso.clone(), storage.clone());
+            client.begin();
+            client.set(k1.clone(), b"a1".to_vec()).unwrap();
+            assert!(
+                client.set(k2.clone(), b"a2".to_vec()).is_err(),
+                "2nd set should fail while key is locked"
+            );
+            // Failed set() aborts and releases the primary lock on k1.
+
+            let mut writer = make_pessimistic_client(tso.clone(), storage.clone());
+            writer.begin();
+            writer.set(k1.clone(), b"ok1".to_vec()).unwrap();
+            assert!(writer.commit().unwrap(), "k1 should be free after rollback");
+
+            let mut reader = make_client(tso, storage);
+            reader.begin();
+            assert_eq!(reader.get(k1.clone()).unwrap(), b"ok1");
+            assert!(reader.get(k2.clone()).unwrap().is_empty());
+            assert!(reader.get(k3.clone()).unwrap().is_empty());
+        }
+
+        // --- 3) Primary + 2nd lock, 3rd conflicts → abort, nothing committed ---
+        {
+            let tso = TimestampOracle::new();
+            let storage = MemoryStorage::default();
+            block_key(&tso, &storage, &k3);
+
+            let mut client = make_pessimistic_client(tso.clone(), storage.clone());
+            client.begin();
+            client.set(k1.clone(), b"b1".to_vec()).unwrap();
+            client.set(k2.clone(), b"b2".to_vec()).unwrap();
+            assert!(
+                client.set(k3.clone(), b"b3".to_vec()).is_err(),
+                "3rd set should fail while key is locked"
+            );
+
+            let mut reader = make_client(tso.clone(), storage.clone());
+            reader.begin();
+            assert!(
+                reader.get(k1.clone()).unwrap().is_empty(),
+                "k1 must not stay committed after abort"
+            );
+            assert!(
+                reader.get(k2.clone()).unwrap().is_empty(),
+                "k2 must not stay committed after abort"
+            );
+
+            // Earlier keys must be free for a new pessimistic writer.
+            let mut writer = make_pessimistic_client(tso, storage);
+            writer.begin();
+            writer.set(k1, b"ok1".to_vec()).unwrap();
+            writer.set(k2, b"ok2".to_vec()).unwrap();
+            assert!(writer.commit().unwrap());
+        }
+    }
 }
